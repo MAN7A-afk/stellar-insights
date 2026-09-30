@@ -75,20 +75,8 @@ pub fn validate_env() -> Result<()> {
 
     // Specific, actionable validation for JWT_SECRET
     if let Ok(jwt_secret) = env::var("JWT_SECRET") {
-        if jwt_secret == "CHANGE_ME_generate_with_openssl_rand_base64_48" {
-            errors.push(
-                "JWT_SECRET is set to the placeholder value. \
-                This is a critical security risk. \
-                Generate a secure secret with: openssl rand -base64 48"
-                    .to_string(),
-            );
-        } else if jwt_secret.len() < 32 {
-            errors.push(format!(
-                "JWT_SECRET is too short ({} characters). \
-                Must be at least 32 characters. \
-                Generate a secure secret with: openssl rand -base64 48",
-                jwt_secret.len()
-            ));
+        if let Err(e) = validate_jwt_secret_strength(&jwt_secret) {
+            errors.push(e);
         }
     }
 
@@ -417,16 +405,37 @@ fn validate_webhook_dispatcher_max_restarts(value: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Validate JWT secret strength and return a descriptive error if it fails.
+///
+/// Rejects:
+/// - Any value that starts with `"CHANGE_ME"` (placeholder pattern)
+/// - Any value shorter than 32 characters
+///
+/// Called during startup validation before the server binds.
+pub fn validate_jwt_secret_strength(secret: &str) -> std::result::Result<(), String> {
+    if secret.starts_with("CHANGE_ME") {
+        return Err(
+            "JWT_SECRET is set to the placeholder value. \
+            This is a critical security risk. \
+            Generate a secure secret with: openssl rand -base64 48"
+                .to_string(),
+        );
+    }
+    if secret.len() < 32 {
+        return Err(format!(
+            "JWT_SECRET is too short ({} characters). \
+            Must be at least 32 characters. \
+            Generate a secure secret with: openssl rand -base64 48",
+            secret.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Validate JWT secret
 /// Must not be the placeholder value and should be at least 32 characters
 fn validate_jwt_secret(value: &str) -> bool {
-    // Check if it's the placeholder value
-    if value == "CHANGE_ME_generate_with_openssl_rand_base64_48" {
-        return false;
-    }
-
-    // Ensure minimum length of 32 characters for security
-    value.len() >= 32
+    validate_jwt_secret_strength(value).is_ok()
 }
 
 /// Validate encryption key
@@ -703,6 +712,68 @@ mod tests {
         std::env::remove_var("DATABASE_URL");
         std::env::remove_var("ENCRYPTION_KEY");
         std::env::remove_var("JWT_SECRET");
+    }
+
+    // ── validate_jwt_secret_strength unit tests (issue #2319) ────────────────
+
+    #[test]
+    fn test_jwt_secret_strength_rejects_placeholder() {
+        let err = validate_jwt_secret_strength(
+            "CHANGE_ME_generate_with_openssl_rand_base64_48",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("placeholder"),
+            "Error should mention 'placeholder', got: {err}"
+        );
+        assert!(
+            err.contains("openssl rand -base64 48"),
+            "Error should include generation command, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_jwt_secret_strength_rejects_any_change_me_prefix() {
+        // Any value starting with "CHANGE_ME" must be rejected, not just the
+        // exact placeholder string.
+        let err = validate_jwt_secret_strength("CHANGE_ME_something_else_entirely")
+            .unwrap_err();
+        assert!(
+            err.contains("placeholder"),
+            "Error should mention 'placeholder', got: {err}"
+        );
+        assert!(
+            err.contains("openssl rand -base64 48"),
+            "Error should include generation command, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_jwt_secret_strength_rejects_short_secret() {
+        let err = validate_jwt_secret_strength("tooshort").unwrap_err();
+        assert!(
+            err.contains("too short"),
+            "Error should mention 'too short', got: {err}"
+        );
+        assert!(
+            err.contains("32 characters"),
+            "Error should mention minimum length, got: {err}"
+        );
+        assert!(
+            err.contains("openssl rand -base64 48"),
+            "Error should include generation command, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_jwt_secret_strength_accepts_valid_48_char_secret() {
+        // A realistic openssl rand -base64 48 output is 64 base64 chars; use a
+        // simple 48-char ASCII string to verify the minimum length passes.
+        let secret = "a".repeat(48);
+        assert!(
+            validate_jwt_secret_strength(&secret).is_ok(),
+            "Should accept a 48-character secret"
+        );
     }
 }
 
