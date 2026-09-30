@@ -82,20 +82,8 @@ pub fn validate_env() -> Result<()> {
 
     // Specific, actionable validation for ENCRYPTION_KEY
     if let Ok(encryption_key) = env::var("ENCRYPTION_KEY") {
-        if encryption_key == "CHANGE_ME_generate_with_openssl_rand_hex_32" {
-            errors.push(
-                "ENCRYPTION_KEY is set to the placeholder value. \
-                This is a critical security risk. \
-                Generate a secure encryption key with: openssl rand -hex 32"
-                    .to_string(),
-            );
-        } else if encryption_key.len() < 64 {
-            errors.push(format!(
-                "ENCRYPTION_KEY is too short ({} characters). \
-                Must be 64 characters (32 bytes as hex). \
-                Generate a secure encryption key with: openssl rand -hex 32",
-                encryption_key.len()
-            ));
+        if let Err(e) = validate_encryption_key_strength(&encryption_key) {
+            errors.push(e);
         }
     }
 
@@ -438,16 +426,58 @@ fn validate_jwt_secret(value: &str) -> bool {
     validate_jwt_secret_strength(value).is_ok()
 }
 
+/// Validate encryption key strength and return a descriptive error if it fails.
+///
+/// Rejects:
+/// - Any value starting with `"CHANGE_ME"` (placeholder pattern)
+/// - Any value that is not exactly 64 characters (must encode exactly 32 bytes as hex)
+/// - Any value that contains non-hex characters
+/// - Any value composed of a single repeated character (e.g. 64 zeros or 64 `a`s)
+///
+/// Called during startup validation before the server binds.
+pub fn validate_encryption_key_strength(key: &str) -> std::result::Result<(), String> {
+    const CMD: &str = "openssl rand -hex 32";
+
+    if key.starts_with("CHANGE_ME") {
+        return Err(format!(
+            "ENCRYPTION_KEY is set to the placeholder value. \
+            This is a critical security risk. \
+            Generate a secure encryption key with: {CMD}"
+        ));
+    }
+
+    if key.len() != 64 {
+        return Err(format!(
+            "ENCRYPTION_KEY must be exactly 64 hex characters (32 bytes), \
+            got {} characters. \
+            Generate a secure encryption key with: {CMD}",
+            key.len()
+        ));
+    }
+
+    if !key.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "ENCRYPTION_KEY must contain only hexadecimal characters (0-9, a-f, A-F). \
+            Generate a secure encryption key with: {CMD}"
+        ));
+    }
+
+    // Reject trivially weak keys: all characters identical (e.g. 64 zeros).
+    let first = key.chars().next().expect("length already checked to be 64");
+    if key.chars().all(|c| c == first) {
+        return Err(format!(
+            "ENCRYPTION_KEY is trivially weak (all characters are identical). \
+            Generate a secure encryption key with: {CMD}"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Validate encryption key
 /// Must not be the placeholder value and should be 64 characters (32 bytes as hex)
 fn validate_encryption_key(value: &str) -> bool {
-    // Check if it's the placeholder value
-    if value == "CHANGE_ME_generate_with_openssl_rand_hex_32" {
-        return false;
-    }
-
-    // Ensure minimum length of 64 characters (32 bytes × 2 for hex encoding)
-    value.len() >= 64
+    validate_encryption_key_strength(value).is_ok()
 }
 
 /// Validate Stellar public key format
@@ -608,7 +638,7 @@ mod tests {
         let _guard = crate::lock_env_test();
         std::env::set_var("STELLAR_NETWORK", "mainnet");
         std::env::set_var("DATABASE_URL", "sqlite://test.db");
-        std::env::set_var("ENCRYPTION_KEY", "a".repeat(64));
+        std::env::set_var("ENCRYPTION_KEY", "a3f1c2e4b5d607890a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3");
         std::env::set_var("JWT_SECRET", "a".repeat(48));
 
         let result = validate_env();
@@ -702,7 +732,7 @@ mod tests {
         let _guard = crate::lock_env_test();
         std::env::set_var("STELLAR_NETWORK", "mainnet");
         std::env::set_var("DATABASE_URL", "sqlite://test.db");
-        std::env::set_var("ENCRYPTION_KEY", "a".repeat(64));
+        std::env::set_var("ENCRYPTION_KEY", "a3f1c2e4b5d607890a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3");
         std::env::set_var("JWT_SECRET", "a".repeat(48));
 
         let result = validate_env();
@@ -773,6 +803,77 @@ mod tests {
         assert!(
             validate_jwt_secret_strength(&secret).is_ok(),
             "Should accept a 48-character secret"
+        );
+    }
+
+    // ── validate_encryption_key_strength unit tests (issue #2321) ────────────
+
+    #[test]
+    fn test_encryption_key_strength_rejects_all_zeros() {
+        let err = validate_encryption_key_strength(&"0".repeat(64)).unwrap_err();
+        assert!(
+            err.contains("trivially weak"),
+            "Error should mention 'trivially weak', got: {err}"
+        );
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "Error should include generation command, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_encryption_key_strength_rejects_wrong_length() {
+        // Too short
+        let err = validate_encryption_key_strength("deadbeef").unwrap_err();
+        assert!(
+            err.contains("exactly 64 hex characters"),
+            "Error should mention correct length, got: {err}"
+        );
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "Error should include generation command, got: {err}"
+        );
+
+        // Too long (65 chars)
+        let long = format!("{}0", "a".repeat(64));
+        let err = validate_encryption_key_strength(&long).unwrap_err();
+        assert!(
+            err.contains("exactly 64 hex characters"),
+            "Error should mention correct length, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_encryption_key_strength_rejects_non_hex() {
+        // 64 chars but contains non-hex characters ('z', 'x', ' ')
+        let non_hex = format!("{:z<64}", "");
+        let err = validate_encryption_key_strength(&non_hex).unwrap_err();
+        assert!(
+            err.contains("hexadecimal characters"),
+            "Error should mention hex requirement, got: {err}"
+        );
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "Error should include generation command, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_encryption_key_strength_accepts_valid_hex_key() {
+        // A realistic `openssl rand -hex 32` output (64 lowercase hex chars)
+        let key = "a3f1c2e4b5d607890a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3";
+        assert_eq!(key.len(), 64);
+        assert!(
+            validate_encryption_key_strength(key).is_ok(),
+            "Should accept a valid 64-char lowercase hex key"
+        );
+
+        // Also accept uppercase hex
+        let key_upper = "A3F1C2E4B5D607890A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0C1D2E3";
+        assert_eq!(key_upper.len(), 64);
+        assert!(
+            validate_encryption_key_strength(key_upper).is_ok(),
+            "Should accept a valid 64-char uppercase hex key"
         );
     }
 }
